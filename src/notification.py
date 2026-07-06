@@ -92,6 +92,21 @@ def _safe_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
+
+def _format_wan(value: Any) -> str:
+    """Format a monetary value as '万' unit for Chinese stock reports."""
+    if value is None:
+        return "--"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if abs(v) >= 100_000_000:
+        return f"{v / 100_000_000:.2f}亿"
+    if abs(v) >= 10_000:
+        return f"{v / 10_000:.2f}万"
+    return f"{v:.0f}"
+
 if TYPE_CHECKING:
     from src.analyzer import AnalysisResult
 
@@ -1902,6 +1917,10 @@ class NotificationService(
 
         belong_boards = ctx.get("belong_boards") if isinstance(ctx.get("belong_boards"), list) else []
 
+        # 龙虎榜数据
+        dragon_tiger_block = ctx.get("dragon_tiger") if isinstance(ctx.get("dragon_tiger"), dict) else {}
+        dragon_tiger_data = dragon_tiger_block.get("data") if isinstance(dragon_tiger_block.get("data"), dict) else {}
+
         return {
             "financial_report": financial_report,
             "growth": growth_data,
@@ -1909,6 +1928,7 @@ class NotificationService(
             "belong_boards": belong_boards,
             "sector_top": sector_top,
             "sector_bottom": sector_bottom,
+            "dragon_tiger": dragon_tiger_data,
         }
 
     def _append_fundamental_blocks(self, lines: List[str], result: AnalysisResult) -> None:
@@ -1925,6 +1945,7 @@ class NotificationService(
         self._append_financial_summary(lines, blocks, labels)
         self._append_shareholder_return(lines, blocks, labels)
         self._append_related_boards(lines, blocks, labels)
+        self._append_dragon_tiger_block(lines, blocks, labels)
 
     def _append_financial_summary(
         self,
@@ -2078,6 +2099,88 @@ class NotificationService(
             for name, board_type, _, _ in prepared:
                 lines.append(f"| {name} | {board_type} |")
         lines.append("")
+
+    def _append_dragon_tiger_block(
+        self,
+        lines: List[str],
+        blocks: Dict[str, Any],
+        labels: Dict[str, str],
+    ) -> None:
+        """Append dragon-tiger (龙虎榜) detail block when data is available."""
+        dt = blocks.get("dragon_tiger") or {}
+        is_on_list = dt.get("is_on_list")
+        if not is_on_list:
+            return
+
+        lines.append("### 🐉 龙虎榜")
+        lines.append("")
+
+        # 基本信息行
+        latest_date = dt.get("latest_date") or dt.get("trade_date")
+        recent_count = dt.get("recent_count", 0)
+        reason = dt.get("reason")
+        info_parts = []
+        if latest_date:
+            info_parts.append(f"最近上榜: {latest_date}")
+        if recent_count:
+            info_parts.append(f"近期上榜 {recent_count} 次")
+        if reason:
+            info_parts.append(f"原因: {reason}")
+        if info_parts:
+            lines.append(" | ".join(info_parts))
+            lines.append("")
+
+        # 买卖总额
+        total_buy = dt.get("total_buy")
+        total_sell = dt.get("total_sell")
+        net_inflow = dt.get("net_inflow")
+        if total_buy is not None or total_sell is not None:
+            buy_str = f"买入 {_format_wan(total_buy)}" if total_buy is not None else ""
+            sell_str = f"卖出 {_format_wan(total_sell)}" if total_sell is not None else ""
+            net_str = f"净额 {_format_wan(net_inflow)}" if net_inflow is not None else ""
+            parts = [p for p in [buy_str, sell_str, net_str] if p]
+            if parts:
+                lines.append(f"总额: {' | '.join(parts)}")
+                lines.append("")
+
+        # 机构汇总
+        inst_summary = dt.get("institutional_summary")
+        if inst_summary and isinstance(inst_summary, dict):
+            inst_buy = inst_summary.get("inst_buy")
+            inst_sell = inst_summary.get("inst_sell")
+            inst_net = inst_summary.get("inst_net")
+            inst_count = inst_summary.get("inst_count", 0)
+            if inst_count > 0:
+                lines.append(f"机构参与 {inst_count} 家")
+                inst_parts = []
+                if inst_buy is not None:
+                    inst_parts.append(f"买入 {_format_wan(inst_buy)}")
+                if inst_sell is not None:
+                    inst_parts.append(f"卖出 {_format_wan(inst_sell)}")
+                if inst_net is not None:
+                    inst_parts.append(f"净额 {_format_wan(inst_net)}")
+                if inst_parts:
+                    lines.append(" | ".join(inst_parts))
+                lines.append("")
+
+        # 席位明细（最多显示前5）
+        seats = dt.get("seats") or []
+        if seats:
+            lines.append("| 序号 | 席位 | 类型 | 买入 | 卖出 | 净额 |")
+            lines.append("|:---:|:-----|:----:|-----:|-----:|-----:|")
+            for idx, seat in enumerate(seats[:5], 1):
+                name = str(seat.get("name", "")).strip()
+                if len(name) > 16:
+                    name = name[:14] + ".."
+                seat_type = str(seat.get("type", "")).strip()
+                buy_val = seat.get("buy")
+                sell_val = seat.get("sell")
+                net_val = seat.get("net")
+                buy_str = _format_wan(buy_val) if buy_val is not None else "--"
+                sell_str = _format_wan(sell_val) if sell_val is not None else "--"
+                net_str = _format_wan(net_val) if net_val is not None else "--"
+                lines.append(f"| {idx} | {name} | {seat_type} | {buy_str} | {sell_str} | {net_str} |")
+            lines.append("")
 
     def _should_use_image_for_channel(
         self, channel: NotificationChannel, image_bytes: Optional[bytes]

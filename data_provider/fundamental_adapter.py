@@ -527,6 +527,261 @@ class AkshareFundamentalAdapter:
         result["latest_date"] = max(recent_dates).date().isoformat() if recent_dates else (
             max(parsed_dates).date().isoformat() if parsed_dates else None
         )
+        # 尝试获取最近一次上榜的席位明细
+        result["detail"] = self._get_latest_longhu_detail(stock_code, lookback_days)
+
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
+        return result
+
+    def _get_latest_longhu_detail(
+        self, stock_code: str, lookback_days: int = 20
+    ) -> Dict[str, Any]:
+        """获取最近一次上榜的龙虎榜席位明细。"""
+        detail: Dict[str, Any] = {
+            "trade_date": None,
+            "reason": None,
+            "total_buy": None,
+            "total_sell": None,
+            "net_inflow": None,
+            "seats": [],
+        }
+        try:
+            import akshare as ak
+        except Exception:
+            return detail
+
+        target_code = _normalize_code(stock_code)
+
+        # 尝试获取龙虎榜明细（需要指定日期）
+        # 先获取最近上榜日期，再获取当日明细
+        now = datetime.now()
+        for days_back in range(0, lookback_days + 1):
+            check_date = (now - timedelta(days=days_back)).strftime("%Y%m%d")
+            try:
+                df = ak.stock_lhb_detail_em(start_date=check_date, end_date=check_date)
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    continue
+
+                # 按股票代码过滤
+                code_cols = [c for c in df.columns if any(k in str(c) for k in ("代码", "股票代码", "证券代码"))]
+                matched = pd.DataFrame()
+                for col in code_cols:
+                    try:
+                        series = df[col].astype(str).map(_normalize_code)
+                        cur = df[series == target_code]
+                        if not cur.empty:
+                            matched = cur
+                            break
+                    except Exception:
+                        continue
+                if matched.empty:
+                    continue
+
+                # 取最新一行
+                row = matched.iloc[0]
+
+                # 解析上榜原因
+                reason = _safe_str(_pick_by_keywords(row, ["上榜原因", "原因", "reason"]))
+
+                # 解析买入/卖出总额
+                detail["trade_date"] = check_date
+                detail["reason"] = reason
+                detail["total_buy"] = _safe_float(_pick_by_keywords(row, ["买入总额", "买入", "买入额", "买入金额"]))
+                detail["total_sell"] = _safe_float(_pick_by_keywords(row, ["卖出总额", "卖出", "卖出额", "卖出金额"]))
+                if detail["total_buy"] is not None and detail["total_sell"] is not None:
+                    detail["net_inflow"] = detail["total_buy"] - detail["total_sell"]
+
+                # 尝试获取当日席位明细
+                self._fill_seats(detail, stock_code, check_date)
+                break  # 找到最近一次就停止
+
+            except Exception:
+                continue
+
+        return detail
+
+    def _fill_seats(
+        self, detail: Dict[str, Any], stock_code: str, trade_date: str
+    ) -> None:
+        """填充席位级别的买卖明细，使用 stock_lhb_stock_detail_em 获取买入/卖出 Top5。"""
+        try:
+            import akshare as ak
+        except Exception:
+            return
+
+        try:
+            if detail.get("seats"):
+                return
+
+            date_str = str(trade_date).replace("-", "")
+            seat_map: Dict[str, Dict[str, Any]] = {}  # seat_name -> merged
+
+            for flag in ("买入", "卖出"):
+                try:
+                    df = ak.stock_lhb_stock_detail_em(
+                        symbol=stock_code, date=date_str, flag=flag
+                    )
+                except Exception:
+                    continue
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    continue
+
+                for _, row in df.iterrows():
+                    seat_name = _safe_str(
+                        _pick_by_keywords(row, ["营业部", "席位", "机构", "名称", "name"])
+                    )
+                    if not seat_name:
+                        continue
+
+                    if seat_name not in seat_map:
+                        seat_map[seat_name] = {"name": seat_name, "buy": 0.0, "sell": 0.0}
+
+                    buy_val = _safe_float(
+                        _pick_by_keywords(row, ["买入金额", "买入额", "买入"])
+                    )
+                    sell_val = _safe_float(
+                        _pick_by_keywords(row, ["卖出金额", "卖出额", "卖出"])
+                    )
+
+                    if flag == "买入" and buy_val is not None:
+                        seat_map[seat_name]["buy"] = buy_val
+                    if flag == "卖出" and sell_val is not None:
+                        seat_map[seat_name]["sell"] = sell_val
+
+            if not seat_map:
+                return
+
+            # 合并买卖，计算净额，分类
+            seats: List[Dict[str, Any]] = []
+            for name, info in seat_map.items():
+                buy_amount = info["buy"]
+                sell_amount = info["sell"]
+                net = buy_amount - sell_amount if buy_amount or sell_amount else None
+
+                seat_type = "未知"
+                if any(k in name for k in ("机构", "基金", "社保", "QFII", "险资", "深股通", "沪股通")):
+                    seat_type = "机构"
+                elif any(k in name for k in ("营业部", "证券", "投资", "资本", "资产")):
+                    seat_type = "游资"
+
+                seats.append({
+                    "name": name,
+                    "buy": buy_amount,
+                    "sell": sell_amount,
+                    "net": net,
+                    "type": seat_type,
+                })
+
+            # 按净额绝对值排序
+            seats.sort(key=lambda s: abs(s.get("net") or 0), reverse=True)
+            detail["seats"] = seats[:10]
+
+            # 机构汇总
+            inst_seats = [s for s in seats if s["type"] == "机构"]
+            if inst_seats:
+                detail["institutional_summary"] = {
+                    "inst_buy": sum(s.get("buy") or 0 for s in inst_seats),
+                    "inst_sell": sum(s.get("sell") or 0 for s in inst_seats),
+                    "inst_net": sum(s.get("net") or 0 for s in inst_seats),
+                    "inst_count": len(inst_seats),
+                }
+
+        except Exception:
+            pass
+
+    def get_market_longhu_daily(
+        self, trade_date: Optional[str] = None, top_n: int = 15
+    ) -> Dict[str, Any]:
+        """
+        获取全市场今日龙虎榜汇总，按净买入排序。
+
+        Args:
+            trade_date: 交易日期，格式 YYYYMMDD，默认今天
+            top_n: 返回前 N 条
+
+        Returns:
+            {"status": "ok", "data": [...], "errors": []}
+        """
+        result: Dict[str, Any] = {
+            "status": "error",
+            "data": [],
+            "source_chain": [],
+            "errors": [],
+        }
+        try:
+            import akshare as ak
+        except Exception as e:
+            result["errors"].append(str(e))
+            return result
+
+        if trade_date is None:
+            trade_date = datetime.now().strftime("%Y%m%d")
+
+        df, source_name, errors = self._call_df_candidates(
+            candidates=[("stock_lhb_detail_em", {"start_date": trade_date, "end_date": trade_date})],
+        )
+        if df is None or df.empty:
+            result["errors"].extend(errors or ["无龙虎榜数据"])
+            return result
+
+        # 按股票聚合，计算每只股票净买入
+        code_col = None
+        name_col = None
+        reason_col = None
+        buy_col = None
+        sell_col = None
+
+        for col in df.columns:
+            col_str = str(col)
+            if any(k in col_str for k in ("代码", "股票代码", "证券代码")) and code_col is None:
+                code_col = col
+            if any(k in col_str for k in ("名称", "股票名称", "证券名称")) and name_col is None:
+                name_col = col
+            if any(k in col_str for k in ("原因", "上榜原因", "理由")) and reason_col is None:
+                reason_col = col
+            if any(k in col_str for k in ("买入额", "买入", "买入金额")) and buy_col is None:
+                buy_col = col
+            if any(k in col_str for k in ("卖出额", "卖出", "卖出金额")) and sell_col is None:
+                sell_col = col
+
+        if code_col is None:
+            result["errors"].append("无法识别股票代码列")
+            return result
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for _, row in df.iterrows():
+            code = _normalize_code(str(row[code_col]))
+            if not code:
+                continue
+            if code not in grouped:
+                grouped[code] = {
+                    "code": code,
+                    "name": _safe_str(name_col and row.get(name_col)) or code,
+                    "reason": _safe_str(reason_col and row.get(reason_col)) or "",
+                    "total_buy": 0.0,
+                    "total_sell": 0.0,
+                }
+            if buy_col:
+                grouped[code]["total_buy"] += _safe_float(row.get(buy_col)) or 0.0
+            if sell_col:
+                grouped[code]["total_sell"] += _safe_float(row.get(sell_col)) or 0.0
+
+        # 计算净额并排序
+        data_list: List[Dict[str, Any]] = []
+        for info in grouped.values():
+            net = info["total_buy"] - info["total_sell"]
+            data_list.append({
+                "code": info["code"],
+                "name": info["name"],
+                "reason": info["reason"],
+                "total_buy": info["total_buy"],
+                "total_sell": info["total_sell"],
+                "net_inflow": net,
+            })
+
+        data_list.sort(key=lambda x: x["net_inflow"], reverse=True)
+        result["data"] = data_list[:top_n]
+        result["status"] = "ok"
+        result["source_chain"].append(f"market_longhu_daily:{source_name}")
         return result

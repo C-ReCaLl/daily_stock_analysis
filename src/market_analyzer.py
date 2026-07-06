@@ -93,6 +93,9 @@ class MarketOverview:
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
+    
+    # 全市场龙虎榜汇总
+    longhu_daily: List[Dict] = field(default_factory=list)    # 今日龙虎榜Top股票
 
 
 @dataclass
@@ -330,7 +333,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         Returns:
             MarketOverview: 市场概览数据对象
         """
-        today = datetime.now().strftime('%Y-%m-%d')
+        now = datetime.now()
+        today = now.strftime('%Y-%m-%d')
+        # A股收盘时间 15:00，盘中运行时标注快照
+        if self.region == "cn" and now.hour < 15:
+            today += "（盘中快照，非收盘复盘）"
         overview = MarketOverview(date=today)
         
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
@@ -344,7 +351,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
         
-        # 4. 获取北向资金（可选）
+        # 4. 获取全市场龙虎榜汇总（A 股）
+        if self.region == "cn":
+            self._get_longhu_daily(overview)
+        
+        # 5. 获取北向资金（可选）
         # self._get_north_flow(overview)
         
         return overview
@@ -446,6 +457,34 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error("[大盘] %s action=get_sector_rankings status=failed error=%s", self._log_context(), e)
+
+    def _get_longhu_daily(self, overview: MarketOverview):
+        """获取全市场龙虎榜汇总"""
+        if self.region != "cn":
+            return
+        try:
+            logger.info("[大盘] %s action=get_longhu_daily status=start", self._log_context())
+
+            from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+            adapter = AkshareFundamentalAdapter()
+            result = adapter.get_market_longhu_daily(top_n=15)
+
+            if result.get("status") == "ok" and result.get("data"):
+                overview.longhu_daily = result["data"]
+                logger.info(
+                    "[大盘] %s action=get_longhu_daily status=success count=%d",
+                    self._log_context(),
+                    len(overview.longhu_daily),
+                )
+            else:
+                logger.warning(
+                    "[大盘] %s action=get_longhu_daily status=empty errors=%s",
+                    self._log_context(),
+                    result.get("errors", []),
+                )
+
+        except Exception as e:
+            logger.error("[大盘] %s action=get_longhu_daily status=failed error=%s", self._log_context(), e)
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -722,6 +761,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 sector_block,
             )
 
+        # 追加龙虎榜板块（在报告末尾）
+        longhu_block = self._build_longhu_block(overview)
+        if longhu_block:
+            review = review.rstrip() + "\n\n" + longhu_block + "\n"
+
         return review
 
     @staticmethod
@@ -963,6 +1007,51 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         for idx, item in enumerate(news[:5], 1):
             lines.append(self._format_news_catalyst_line(idx, item, language=language))
         return "\n".join(lines)
+
+    def _build_longhu_block(self, overview: MarketOverview) -> str:
+        """Build market-wide dragon-tiger list block."""
+        if not overview.longhu_daily:
+            return ""
+        language = self._get_review_language()
+        lines = []
+        if language == "en":
+            lines.extend([
+                "### 🐉 Dragon-Tiger List (Top 15)",
+                "",
+                "| Rank | Stock | Net Buy | Reason |",
+                "|------|-------|---------|--------|",
+            ])
+            for rank, item in enumerate(overview.longhu_daily[:15], 1):
+                name = item.get("name", item.get("code", "-"))
+                net = item.get("net_inflow")
+                net_str = self._format_wan(net) if net is not None else "--"
+                reason = str(item.get("reason", ""))[:20] or "-"
+                lines.append(f"| {rank} | {name} | {net_str} | {reason} |")
+        else:
+            lines.extend([
+                "### 🐉 今日龙虎榜 Top 15",
+                "",
+                "| 排名 | 股票 | 净买入 | 上榜原因 |",
+                "|:---:|:-----|-------:|:---------|",
+            ])
+            for rank, item in enumerate(overview.longhu_daily[:15], 1):
+                name = item.get("name", item.get("code", "-"))
+                net = item.get("net_inflow")
+                net_str = self._format_wan(net) if net is not None else "--"
+                reason = str(item.get("reason", ""))[:20] or "-"
+                lines.append(f"| {rank} | {name} | {net_str} | {reason} |")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_wan(value: float) -> str:
+        """Format monetary value as wan/yi."""
+        if value is None:
+            return "--"
+        if abs(value) >= 100_000_000:
+            return f"{value / 100_000_000:.2f}亿"
+        if abs(value) >= 10_000:
+            return f"{value / 10_000:.2f}万"
+        return f"{value:.0f}"
 
     @staticmethod
     def _get_news_field(item: Any, field: str) -> str:

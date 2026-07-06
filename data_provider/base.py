@@ -3087,12 +3087,28 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
                 [err or "dragon_tiger failed"],
             )
+        # 提取龙虎榜明细数据
+        detail_data = payload.get("detail", {})
+        detail_payload = {}
+        if isinstance(detail_data, dict) and detail_data.get("trade_date"):
+            detail_payload = {
+                "trade_date": detail_data.get("trade_date"),
+                "reason": detail_data.get("reason"),
+                "total_buy": detail_data.get("total_buy"),
+                "total_sell": detail_data.get("total_sell"),
+                "net_inflow": detail_data.get("net_inflow"),
+                "seats": detail_data.get("seats", []),
+            }
+            if detail_data.get("institutional_summary"):
+                detail_payload["institutional_summary"] = detail_data["institutional_summary"]
+
         return self._build_fundamental_block(
             (payload.get("status") if isinstance(payload.get("status"), str) else "partial"),
             {
                 "is_on_list": bool(payload.get("is_on_list", False)),
                 "recent_count": int(payload.get("recent_count", 0)),
                 "latest_date": payload.get("latest_date"),
+                **detail_payload,
             },
             self._normalize_source_chain(
                 payload.get("source_chain", []),
